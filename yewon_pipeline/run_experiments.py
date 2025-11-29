@@ -204,7 +204,7 @@ def main():
     parser.add_argument(
         "--launcher",
         type=str,
-        default="single",
+        default="torchrun",
         choices=["single", "torchrun"],
         help="How to launch training. 'torchrun' for multi-GPU.",
     )

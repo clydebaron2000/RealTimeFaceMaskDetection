@@ -8,7 +8,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 \
 python run_experiments.py \
   --data_root $DATA_ROOT \
   --output_root /local-ssd/yl3427/test/runs/classifiers \
-  --launcher single \
+  --launcher torchrun \
   --num_workers 8 \
   --nproc_per_node 4
 ```
