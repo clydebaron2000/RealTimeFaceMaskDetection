@@ -204,7 +204,7 @@ class FilterDisplay:
                          right_stats: Optional[Dict[str, Any]]):
         """Add global statistics comparison - positioned lower and out of picture frames"""
         # Position stats below the image frames (out of picture frame area)
-        stats_y = 50 + self.frame_height + 15  # Below the frames with some padding
+        stats_y = 50 + self.frame_height + 40  # Below the frames with some padding
         
         # Left filter stats - positioned lower
         if left_stats:
@@ -238,7 +238,7 @@ class FilterDisplay:
     
     def _add_detector_classifier_info(self, frame: np.ndarray, detector_info: Dict[str, Any]):
         """Add detector/classifier lists and threshold info to the display"""
-        info_y_start = self.display_height - 65
+        info_y_start = self.display_height - 50
         
         # Get detector and classifier info
         available_detectors = detector_info.get('available_detectors', [])
@@ -285,20 +285,27 @@ class FilterDisplay:
         )
     
     def _add_threshold_info(self, frame: np.ndarray, detector_info: Dict[str, Any]):
-        """Add threshold info positioned on bottom left next to faces count"""
+        """Add threshold info positioned on top right of left header for detection"""
         if not detector_info:
             return
         
         confidence_threshold = detector_info.get('confidence_threshold', 0.6)
-        
-        # Position threshold on bottom left, next to the faces count
-        threshold_y = 50 + self.frame_height + 35  # Below the faces count with some spacing
         threshold_text = f"Threshold: {confidence_threshold:.2f}"
+        
+        # Calculate text width to position it properly on the right side of left header
+        (text_width, text_height), _ = cv2.getTextSize(
+            threshold_text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1
+        )
+        
+        # Position threshold on top right of left side header area
+        # Left frame area goes from x=0 to x=frame_width, so position near the right edge
+        threshold_x = self.frame_width - text_width - 10  # 10px padding from right edge of left frame
+        threshold_y = 30  # Same level as the header titles
         
         cv2.putText(
             frame,
             threshold_text,
-            (10, threshold_y),
+            (threshold_x, threshold_y),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.5,
             self.ui_colors['accent'],
