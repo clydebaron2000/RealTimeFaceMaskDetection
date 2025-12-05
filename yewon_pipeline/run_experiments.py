@@ -15,15 +15,20 @@ BACKBONES = [
     "vit_b_16",
 ]
 
+# Models trained from scratch (no pretrained weights)
+SCRATCH_MODELS = [
+    "small_cnn",
+    "custom_cnn",
+]
+
 EXPERIMENTS = []
 
-# Common settings (cropped per-face, 2-class, merge incorrect with no-mask)
+# Common settings (2-class, incorrect merged with no-mask)
 BASE_CFG = {
-    "dataset_mode": "cropped",
     "num_classes": 2,
     "merge_incorrect_with_nomask": True,
-    "pretrained": True,
-    "freeze_backbone": False,  # finetune
+    "pretrained": True,      # Backbones use ImageNet pretrained weights
+    "freeze_backbone": False,
     "batch_size": 256,
     "weight_decay": 1e-4,
     "img_size": 224,
@@ -31,42 +36,52 @@ BASE_CFG = {
     "seed": 42,
 }
 
-# (1) 5 backbones × 2 (lr, epochs) settings
+
+# (1) Backbones: small grid of lr × epochs × freeze_backbone
+
+BACKBONE_LRS = [1e-3, 5e-4]
+BACKBONE_EPOCHS = [10, 20]
+BACKBONE_FREEZE_OPTIONS = [True, False]  # True = train head only, False = full finetune
+
 for model_name in BACKBONES:
-    # Setting A: lr=1e-3, epochs=10
-    EXPERIMENTS.append(
-        {
-            "name": f"cropped_{model_name}_pt_finetune_lr1e-3_ep10",
-            "model_name": model_name,
-            "lr": 1e-3,
-            "epochs": 10,
-            **BASE_CFG,
-        }
-    )
-    # Setting B: lr=5e-4, epochs=20
-    EXPERIMENTS.append(
-        {
-            "name": f"cropped_{model_name}_pt_finetune_lr5e-4_ep20",
-            "model_name": model_name,
-            "lr": 5e-4,
-            "epochs": 20,
-            **BASE_CFG,
-        }
-    )
-
-# (2) small_cnn scratch model (train longer)
-for lr, epochs in [(1e-3, 20), (5e-4, 30)]:
-    EXPERIMENTS.append(
-        {
-            "name": f"cropped_small_cnn_scratch_lr{lr}_ep{epochs}",
-            "model_name": "small_cnn",
-            "lr": lr,
-            "epochs": epochs,
-            **BASE_CFG,
-        }
-    )
+    for lr in BACKBONE_LRS:
+        for epochs in BACKBONE_EPOCHS:
+            for freeze in BACKBONE_FREEZE_OPTIONS:
+                freeze_tag = "frozen" if freeze else "ft"  # For name distinction
+                EXPERIMENTS.append(
+                    {
+                        "name": f"{model_name}_{freeze_tag}_lr{lr}_ep{epochs}",
+                        "model_name": model_name,
+                        "lr": lr,
+                        "epochs": epochs,
+                        "freeze_backbone": freeze,  # Overrides BASE_CFG value
+                        **BASE_CFG,
+                    }
+                )
 
 
+# (2) Scratch models (small_cnn + custom_cnn): train longer
+SCRATCH_BASE_CFG = {
+    **BASE_CFG,
+    "pretrained": False,      # False for scratch training
+    "freeze_backbone": False,
+}
+
+SCRATCH_LRS = [1e-3, 5e-4]
+SCRATCH_EPOCHS = [10, 20, 30]
+
+for model_name in SCRATCH_MODELS:
+    for lr in SCRATCH_LRS:
+        for epochs in SCRATCH_EPOCHS:
+            EXPERIMENTS.append(
+                {
+                    "name": f"{model_name}_scratch_lr{lr}_ep{epochs}",
+                    "model_name": model_name,
+                    "lr": lr,
+                    "epochs": epochs,
+                    **SCRATCH_BASE_CFG,
+                }
+            )
 
 
 def build_command(args, exp, output_dir):
@@ -76,15 +91,16 @@ def build_command(args, exp, output_dir):
         base_cmd = [
             "torchrun",
             f"--nproc_per_node={args.nproc_per_node}",
+            "--master_port", str(args.master_port),
             args.pipeline_script,
         ]
     else:
         raise ValueError(f"Unknown launcher: {args.launcher}")
 
     cmd = base_cmd + [
+        "--dataset_mode", args.dataset_mode,
         "--data_root", args.data_root,
         "--output_dir", output_dir,
-        "--dataset_mode", exp["dataset_mode"],
         "--num_classes", str(exp["num_classes"]),
         "--model_name", exp["model_name"],
         "--epochs", str(exp["epochs"]),
@@ -95,6 +111,7 @@ def build_command(args, exp, output_dir):
         "--num_workers", str(args.num_workers),
         "--seed", str(exp.get("seed", 42)),
     ]
+
 
     # incorrect merge setting
     if not exp.get("merge_incorrect_with_nomask", True):
@@ -156,8 +173,6 @@ def run_single_experiment(args, exp):
         "status": status,
         "best_val_acc": best_acc,
         "best_epoch": best_epoch,
-        # Also record config
-        "dataset_mode": exp["dataset_mode"],
         "num_classes": exp["num_classes"],
         "merge_incorrect_with_nomask": exp.get("merge_incorrect_with_nomask", True),
         "model_name": exp["model_name"],
@@ -177,12 +192,39 @@ def main():
     parser = argparse.ArgumentParser(
         description="Run multiple pipeline_1.py experiments and log results to CSV."
     )
+
+    parser.add_argument(
+        "--master_port",
+        type=int,
+        default=29500,
+        help="master_port to use for torchrun (default: 29500).",
+    )
+
+    parser.add_argument(
+        "--dataset_mode",
+        type=str,
+        default="cropped",
+        choices=["cropped", "mask12k"],
+        help=(
+            "Which dataset layout pipeline_1.py should use. "
+            "'cropped' = andrewmvd (images/ + annotations/). "
+            "'mask12k' = Face Mask 12K (Train/Validation/Test with WithMask/WithoutMask)."
+        ),
+    )
+
     parser.add_argument(
         "--data_root",
         type=str,
         required=True,
-        help="Root of dataset (contains 'images/' and 'annotations/').",
+        help=(
+            "Root of dataset. "
+            "If dataset_mode='cropped': contains 'images/' and 'annotations/'. "
+            "If dataset_mode='mask12k': contains 'Train/', 'Validation/', 'Test/'."
+        ),
     )
+
+
+
     parser.add_argument(
         "--output_root",
         type=str,
@@ -204,7 +246,7 @@ def main():
     parser.add_argument(
         "--launcher",
         type=str,
-        default="torchrun",
+        default="single",
         choices=["single", "torchrun"],
         help="How to launch training. 'torchrun' for multi-GPU.",
     )

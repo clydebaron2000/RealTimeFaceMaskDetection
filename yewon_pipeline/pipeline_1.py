@@ -28,8 +28,10 @@ class TrainConfig:
     output_dir: str = "./runs/exp1"
 
     # Dataset mode
+    dataset_mode: str = "cropped"   # "cropped" or "mask12k"
+
     num_classes: int = 2                # 2 or 3
-    merge_incorrect_with_nomask: bool = False  # Whether to merge incorrect with no-mask when num_classes==2
+    merge_incorrect_with_nomask: bool = True  # Whether to merge incorrect with no-mask when num_classes==2
 
     # Model
     model_name: str = "resnet18"        # See build_model() below for options
@@ -243,6 +245,46 @@ class CroppedFaceMaskDataset(Dataset):
             img = self.transform(img)
         return img, label
 
+class Mask12KFolderDataset(Dataset):
+    """
+    For Face Mask 12K Dataset.
+    split_dir:
+        <data_root>/Train
+        <data_root>/Validation
+        <data_root>/Test
+    Each contains WithMask / WithoutMask folders.
+    Labels: 0 = WithoutMask, 1 = WithMask.
+    """
+    def __init__(self, split_dir: str,
+                 transform: Optional[transforms.Compose] = None):
+        super().__init__()
+        self.samples: List[Tuple[str, int]] = []
+        self.transform = transform
+
+        class_specs = [("WithMask", 1), ("WithoutMask", 0)]
+        for class_name, label in class_specs:
+            class_dir = os.path.join(split_dir, class_name)
+            if not os.path.isdir(class_dir):
+                continue
+            for fname in os.listdir(class_dir):
+                if not fname.lower().endswith((".png", ".jpg", ".jpeg")):
+                    continue
+                path = os.path.join(class_dir, fname)
+                self.samples.append((path, label))
+
+        # Sorting helps with reproducibility
+        self.samples.sort()
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int):
+        path, label = self.samples[idx]
+        img = Image.open(path).convert("RGB")
+        if self.transform is not None:
+            img = self.transform(img)
+        return img, label
+
 
 def build_transforms(img_size: int = 224, is_train: bool = True):
     if is_train:
@@ -271,37 +313,58 @@ def build_transforms(img_size: int = 224, is_train: bool = True):
 
 
 def build_datasets_and_loaders(cfg: TrainConfig):
-    images_dir = os.path.join(cfg.data_root, "images")
-    annotations_dir = os.path.join(cfg.data_root, "annotations")
-
     train_transform = build_transforms(cfg.img_size, is_train=True)
     val_transform = build_transforms(cfg.img_size, is_train=False)
 
-    full_dataset = CroppedFaceMaskDataset(
-        images_dir=images_dir,
-        annotations_dir=annotations_dir,
-        num_classes=cfg.num_classes,
-        merge_incorrect_with_nomask=cfg.merge_incorrect_with_nomask,
-        transform=train_transform,
-    )
-    indices = list(range(len(full_dataset)))
-    random.shuffle(indices)
-    split = int(0.8 * len(indices))
-    train_indices = indices[:split]
-    val_indices = indices[split:]
+    if cfg.dataset_mode == "mask12k" and cfg.num_classes != 2:
+        raise ValueError("Mask12K dataset only supports num_classes=2.")
+    
+    if cfg.dataset_mode == "cropped":
+        # === andrewmvd dataset (cropped) ===
+        images_dir = os.path.join(cfg.data_root, "images")
+        annotations_dir = os.path.join(cfg.data_root, "annotations")
 
-    train_dataset = torch.utils.data.Subset(full_dataset, train_indices)
+        full_dataset = CroppedFaceMaskDataset(
+            images_dir=images_dir,
+            annotations_dir=annotations_dir,
+            num_classes=cfg.num_classes,
+            merge_incorrect_with_nomask=cfg.merge_incorrect_with_nomask,
+            transform=train_transform,
+        )
+        indices = list(range(len(full_dataset)))
+        random.shuffle(indices)
+        split = int(0.8 * len(indices))
+        train_indices = indices[:split]
+        val_indices = indices[split:]
 
-    full_dataset_val = CroppedFaceMaskDataset(
-        images_dir=images_dir,
-        annotations_dir=annotations_dir,
-        num_classes=cfg.num_classes,
-        merge_incorrect_with_nomask=cfg.merge_incorrect_with_nomask,
-        transform=val_transform,
-    )
-    val_dataset = torch.utils.data.Subset(full_dataset_val, val_indices)
+        train_dataset = torch.utils.data.Subset(full_dataset, train_indices)
 
+        full_dataset_val = CroppedFaceMaskDataset(
+            images_dir=images_dir,
+            annotations_dir=annotations_dir,
+            num_classes=cfg.num_classes,
+            merge_incorrect_with_nomask=cfg.merge_incorrect_with_nomask,
+            transform=val_transform,
+        )
+        val_dataset = torch.utils.data.Subset(full_dataset_val, val_indices)
 
+    elif cfg.dataset_mode == "mask12k":
+        # === Face Mask 12K (classification only) ===
+        train_dir = os.path.join(cfg.data_root, "Train")
+        val_dir = os.path.join(cfg.data_root, "Validation")
+
+        train_dataset = Mask12KFolderDataset(
+            split_dir=train_dir,
+            transform=train_transform,
+        )
+        val_dataset = Mask12KFolderDataset(
+            split_dir=val_dir,
+            transform=val_transform,
+        )
+    else:
+        raise ValueError(f"Unknown dataset_mode: {cfg.dataset_mode}")
+
+    # Below is common (DDP & DataLoader)
     if cfg.distributed:
         train_sampler = DistributedSampler(train_dataset, shuffle=True)
         val_sampler = DistributedSampler(val_dataset, shuffle=False)
@@ -319,6 +382,7 @@ def build_datasets_and_loaders(cfg: TrainConfig):
         num_workers=cfg.num_workers,
         pin_memory=True,
     )
+
     val_loader = DataLoader(
         val_dataset,
         batch_size=cfg.batch_size,
@@ -327,7 +391,9 @@ def build_datasets_and_loaders(cfg: TrainConfig):
         num_workers=cfg.num_workers,
         pin_memory=True,
     )
+
     return train_loader, val_loader
+
 
 
 class SmallCNN(nn.Module):
@@ -366,17 +432,81 @@ class SmallCNN(nn.Module):
         return x
 
 
+# custom
+class DepthwiseSeparableConv(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size=3, padding=1):
+        super().__init__()
+        self.depthwise = nn.Conv2d(
+            in_channels,
+            in_channels,
+            kernel_size=kernel_size,
+            padding=padding,
+            groups=in_channels,
+            bias=False,
+        )
+        self.pointwise = nn.Conv2d(
+            in_channels,
+            out_channels,
+            kernel_size=1,
+            bias=False,
+        )
+        self.bn = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, x):
+        x = self.depthwise(x)
+        x = self.pointwise(x)
+        x = self.bn(x)
+        x = self.relu(x)
+        return x
+
+
+class CustomCNN(nn.Module):
+    """
+    Custom depthwise-separable CNN architecture.
+    Input resolution is flexible due to AdaptiveAvgPool (40x40, 96x96, 224x224 all supported).
+    """
+    def __init__(self, in_channels: int = 3, num_classes: int = 2):
+        super().__init__()
+        # stem
+        self.conv_stem = nn.Conv2d(in_channels, 32, kernel_size=3, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(32)
+        self.relu = nn.ReLU(inplace=True)
+        self.pool1 = nn.MaxPool2d(2, 2)
+
+        # depthwise-separable blocks
+        self.depthwise_block1 = DepthwiseSeparableConv(32, 64, kernel_size=3, padding=1)
+        self.pool2 = nn.MaxPool2d(2, 2)
+        self.depthwise_block2 = DepthwiseSeparableConv(64, 128, kernel_size=3, padding=1)
+        self.pool3 = nn.MaxPool2d(2, 2)
+
+        # global pooling + head
+        self.global_avg_pool = nn.AdaptiveAvgPool2d((1, 1))
+        self.dropout = nn.Dropout(0.5)
+        self.fc = nn.Linear(128, num_classes)
+
+    def forward(self, x):
+        x = self.conv_stem(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.pool1(x)
+
+        x = self.depthwise_block1(x)
+        x = self.pool2(x)
+        x = self.depthwise_block2(x)
+        x = self.pool3(x)
+
+        x = self.global_avg_pool(x)      # (N, 128, 1, 1)
+        x = torch.flatten(x, 1)          # (N, 128)
+        x = self.dropout(x)
+        x = self.fc(x)                   # (N, num_classes)
+        return x
+
+
+
 def build_model(cfg: TrainConfig) -> nn.Module:
     """
     Create classifier backbone + head.
-
-    Supported model_name:
-      - "resnet18"
-      - "resnet50"
-      - "mobilenet_v3_small"
-      - "efficientnet_b0"
-      - "vit_b_16"
-      - "small_cnn"
     """
     name = cfg.model_name.lower()
 
@@ -437,6 +567,9 @@ def build_model(cfg: TrainConfig) -> nn.Module:
 
     elif name == "small_cnn":
         model = SmallCNN(num_classes=cfg.num_classes)
+
+    elif name == "custom_cnn":
+        model = CustomCNN(in_channels=3, num_classes=cfg.num_classes)
 
     else:
         raise ValueError(f"Unknown model_name: {cfg.model_name}")
@@ -621,13 +754,32 @@ def build_argparser():
     p = argparse.ArgumentParser(
         description="Face Mask Detection Training Pipeline (PyTorch, multi-GPU ready)"
     )
+    p.add_argument(
+        "--dataset_mode",
+        type=str,
+        default="cropped",
+        choices=["cropped", "mask12k"],
+        help=(
+            "'cropped': andrewmvd face-mask-detection.\n"
+            "'mask12k': Face Mask 12K (WithMask/WithoutMask in Train/Validation/Test)."
+        ),
+    )
+
 
     p.add_argument(
         "--data_root",
         type=str,
         required=True,
-        help="Dataset root containing 'images/' and 'annotations/' directories.",
+        help=(
+            "Dataset root. "
+            "If dataset_mode='cropped': contains 'images/' and 'annotations/'. "
+            "If dataset_mode='mask12k': contains 'Train/', 'Validation/', 'Test/' "
+            "with 'WithMask/' and 'WithoutMask/' subfolders."
+        ),
     )
+
+
+
     p.add_argument("--output_dir", type=str, default="./runs/exp1")
 
     p.add_argument("--num_classes", type=int, default=2, choices=[2, 3])
@@ -648,6 +800,7 @@ def build_argparser():
             "efficientnet_b0",
             "vit_b_16",
             "small_cnn",
+            "custom_cnn", 
         ],
     )
     p.add_argument("--pretrained", action="store_true")
@@ -684,6 +837,7 @@ def parse_args_to_config() -> TrainConfig:
     cfg = TrainConfig(
         data_root=args.data_root,
         output_dir=args.output_dir,
+        dataset_mode=args.dataset_mode,
         num_classes=args.num_classes,
         merge_incorrect_with_nomask=not args.no_merge_incorrect,
         model_name=args.model_name,

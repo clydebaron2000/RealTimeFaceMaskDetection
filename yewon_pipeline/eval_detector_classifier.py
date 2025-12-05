@@ -143,21 +143,34 @@ def evaluate_detector_classifier(
 ):
     device = torch.device(device_str if torch.cuda.is_available() else "cpu")
 
+  
     # 1) Load model
     model, num_classes, img_size, merge_incorrect = load_model_from_checkpoint(
         checkpoint, device
     )
 
-    infer_transform = transforms.Compose(
-        [
-            transforms.Resize((img_size, img_size)),
-            transforms.ToTensor(),
-            transforms.Normalize(
-                mean=[0.485, 0.456, 0.406],
-                std=[0.229, 0.224, 0.225],
-            ),
-        ]
-    )
+    # 1-1) Transform branching based on input resolution / normalization policy
+    if img_size <= 64:
+        # For low-resolution models (40x40) without normalization
+        infer_transform = transforms.Compose(
+            [
+                transforms.Resize((img_size, img_size)),
+                transforms.ToTensor(),
+            ]
+        )
+    else:
+        # Standard backbones (224x224, ImageNet normalization)
+        infer_transform = transforms.Compose(
+            [
+                transforms.Resize((img_size, img_size)),
+                transforms.ToTensor(),
+                transforms.Normalize(
+                    mean=[0.485, 0.456, 0.406],
+                    std=[0.229, 0.224, 0.225],
+                ),
+            ]
+        )
+
 
     # 2) Prepare detector
     detector: BaseFaceDetector = build_detector(
@@ -180,6 +193,7 @@ def evaluate_detector_classifier(
     total_images = 0
     total_gt_faces = 0
     total_detected_matched = 0
+    total_pred_boxes = 0 
 
     cls_total = 0
     cls_correct = 0
@@ -239,6 +253,7 @@ def evaluate_detector_classifier(
             y2 = y + h_box
             pred_boxes_xyxy.append([x1, y1, x2, y2])
         pred_boxes_xyxy = np.array(pred_boxes_xyxy, dtype=np.float32)
+        total_pred_boxes += len(pred_boxes_xyxy)
 
         # 4-2) IoU-based matching
         matches = greedy_match_iou(gt_boxes_xyxy, pred_boxes_xyxy, iou_thresh=iou_thresh)
@@ -277,22 +292,83 @@ def evaluate_detector_classifier(
     # ----------------------------
     # Final statistics output
     # ----------------------------
+    # det_recall = total_detected_matched / max(total_gt_faces, 1)
+    # cls_acc = cls_correct / max(cls_total, 1)
+
+    # Detection metrics
     det_recall = total_detected_matched / max(total_gt_faces, 1)
+    det_precision = total_detected_matched / max(total_pred_boxes, 1)
+    if det_precision + det_recall > 0:
+        det_f1 = 2 * det_precision * det_recall / (det_precision + det_recall)
+    else:
+        det_f1 = 0.0
+
+    # Classification metrics (micro = accuracy)
     cls_acc = cls_correct / max(cls_total, 1)
+
+    # Classification macro precision / recall / F1 (confusion matrix based)
+    per_class_prec = []
+    per_class_rec = []
+    per_class_f1 = []
+
+    for c in range(num_classes):
+        tp = conf_mat[c, c]
+        fp = conf_mat[:, c].sum() - tp
+        fn = conf_mat[c, :].sum() - tp
+
+        prec_c = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        rec_c  = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        if prec_c + rec_c > 0:
+            f1_c = 2 * prec_c * rec_c / (prec_c + rec_c)
+        else:
+            f1_c = 0.0
+
+        per_class_prec.append(prec_c)
+        per_class_rec.append(rec_c)
+        per_class_f1.append(f1_c)
+
+    macro_prec = sum(per_class_prec) / num_classes
+    macro_rec  = sum(per_class_rec) / num_classes
+    macro_f1   = sum(per_class_f1) / num_classes
+
+    # Combined pipeline recall metric
+    pipeline_recall = det_recall * cls_acc
+
+
+
 
     print("\n===== Detector + Classifier Evaluation Result =====")
     print(f"Data root         : {data_root}")
     print(f"Checkpoint        : {checkpoint}")
     print(f"Detector          : {detector_name}")
     print(f"IoU threshold     : {iou_thresh}")
-    print(f"Images processed  : {total_images}")
-    print(f"Total GT faces    : {total_gt_faces}")
-    print(f"Matched detections: {total_detected_matched}")
-    print(f"Detection recall  : {det_recall:.4f}")
-    print(f"Cls samples       : {cls_total}")
-    print(f"Cls accuracy      : {cls_acc:.4f}")
+    # print(f"Images processed  : {total_images}")
+    # print(f"Total GT faces    : {total_gt_faces}")
+    # print(f"Matched detections: {total_detected_matched}")
+    # print(f"Detection recall  : {det_recall:.4f}")
+    # print(f"Cls samples       : {cls_total}")
+    # print(f"Cls correct       : {cls_correct}")
+    # print(f"Cls accuracy      : {cls_acc:.4f}")
+    # print("Confusion matrix (rows=GT, cols=Pred):")
+    # print(conf_mat)
+    print(f"Total images           : {total_images}")
+    print(f"Total GT faces         : {total_gt_faces}")
+    print(f"Total predicted boxes  : {total_pred_boxes}")
+    print(f"Matched detections     : {total_detected_matched}")
+    print(f"Detection recall       : {det_recall:.4f}")
+    print(f"Detection precision    : {det_precision:.4f}")
+    print(f"Detection F1           : {det_f1:.4f}")
+    print(f"Cls samples            : {cls_total}")
+    print(f"Cls correct            : {cls_correct}")
+    print(f"Cls accuracy (micro F1): {cls_acc:.4f}")
+    print(f"Cls macro precision    : {macro_prec:.4f}")
+    print(f"Cls macro recall       : {macro_rec:.4f}")
+    print(f"Cls macro F1           : {macro_f1:.4f}")
+    print(f"Pipeline recall        : {pipeline_recall:.4f}")
     print("Confusion matrix (rows=GT, cols=Pred):")
     print(conf_mat)
+
+
 
     # CSV save option
     if results_csv is not None:
@@ -311,11 +387,20 @@ def evaluate_detector_classifier(
                         "images",
                         "total_gt_faces",
                         "matched_detections",
+                        "total_pred_boxes",
                         "det_recall",
+                        "det_precision",
+                        "det_f1",
                         "cls_samples",
-                        "cls_acc",
+                        "cls_correct",
+                        "cls_acc",              # micro
+                        "cls_macro_precision",
+                        "cls_macro_recall",
+                        "cls_macro_f1",
+                        "pipeline_recall",
                     ]
                 )
+
             writer.writerow(
                 [
                     data_root,
@@ -325,9 +410,17 @@ def evaluate_detector_classifier(
                     total_images,
                     total_gt_faces,
                     total_detected_matched,
+                    total_pred_boxes,
                     det_recall,
+                    det_precision,
+                    det_f1,
                     cls_total,
+                    cls_correct,
                     cls_acc,
+                    macro_prec,
+                    macro_rec,
+                    macro_f1,
+                    pipeline_recall,
                 ]
             )
 

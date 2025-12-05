@@ -1,0 +1,31 @@
+# Python cache files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+
+# Log files
+*.log
+
+# Model artifacts (too large for GitHub)
+yewon_pipeline/runs_12k/
+yewon_pipeline/runs_cropped/
+*.pth
+*.pt
+*.ckpt
+
+# Input data directories
+yewon_pipeline/input/
+
+# IDE and system files
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
